@@ -149,7 +149,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   Prefab: {fileID: 8533189469475931152, guid: 1e483be4b757ce144998b1a90cd3ef88, type: 3}
-  Count: 1000
+  Count: 100
   FieldSize:
     x: 50
     y: 50

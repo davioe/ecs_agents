@@ -23,5 +23,15 @@ public partial struct SpawnerJob : IJobParallelFor
         var newEntity = Ecb.Instantiate(index, Prefab);
 
         Ecb.SetComponent(index, newEntity, LocalTransform.FromPosition(randomPosition));
+
+        var faceMouseComponent = new FaceMouseComponent
+        {
+            RotationSpeed = 100f,
+            LockPitch = 1,
+            PlaneY = 0f
+
+        };
+
+        Ecb.AddComponent(index, newEntity, faceMouseComponent);
     }
 }
