@@ -41,13 +41,13 @@ Shader "Custom/InstancedIndirectLit"
             #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/SpaceTransforms.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl"
 
-            StructuredBuffer<float4x4> _InstanceMatrices;
+            StructuredBuffer<float4x4> _PerInstanceMatrices;
 
             void InstancingSetup()
             {
                 #ifdef UNITY_PROCEDURAL_INSTANCING_ENABLED
-                unity_ObjectToWorld = _InstanceMatrices[unity_InstanceID];
-                unity_WorldToObject = transpose(unity_ObjectToWorld); // Simple inverse for uniform scale; for non-uniform, use full inverse
+                    unity_ObjectToWorld = _PerInstanceMatrices[unity_InstanceID];
+                    unity_WorldToObject = transpose(unity_ObjectToWorld);
                 #endif
             }
 
@@ -151,12 +151,12 @@ Shader "Custom/InstancedIndirectLit"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl"
 
-            StructuredBuffer<float4x4> _InstanceMatrices;
+            StructuredBuffer<float4x4> _PerInstanceMatrices;
 
             void InstancingSetup()
             {
                 #ifdef UNITY_PROCEDURAL_INSTANCING_ENABLED
-                unity_ObjectToWorld = _InstanceMatrices[unity_InstanceID];
+                unity_ObjectToWorld = _PerInstanceMatrices[unity_InstanceID];
                 unity_WorldToObject = transpose(unity_ObjectToWorld); // Simple inverse
                 #endif
             }

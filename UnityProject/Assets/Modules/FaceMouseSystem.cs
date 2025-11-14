@@ -20,15 +20,12 @@ public partial class FaceMouseSystem : SystemBase
 
         float dt = SystemAPI.Time.DeltaTime;
 
-        // Job instanziieren und parallel schedulen
         var job = new FaceMouseJob
         {
             RayOrigin = rayOrigin,
             RayDir = rayDir,
             DeltaTime = dt
         };
-
-        // Schedule parallel; der Job arbeitet auf LocalTransform (ref) & FaceMouseComponent (in)
         this.Dependency = job.ScheduleParallel(this.Dependency);
     }
 
@@ -39,12 +36,15 @@ public partial class FaceMouseSystem : SystemBase
         public float3 RayDir;
         public float DeltaTime;
 
-        // Execute wird für jede Entity mit (ref LocalTransform, in FaceMouseComponent) ausgeführt
-        public void Execute(ref LocalTransform tf, in FaceMouseComponent fm)
+        public void Execute(ref LocalToWorld ltw, in FaceMouseComponent fm)
         {
             const float eps = 1e-6f;
 
-            // 1) Schnittpunkt Ray <-> Ebene y = PlaneY berechnen
+            // Extrahiere Position/Rotation aus ltw
+            float3 pos = ltw.Position;
+            quaternion rot = ltw.Rotation;
+
+            // Berechne Zielpunkt auf Ebene
             float3 targetWorld;
             if (math.abs(RayDir.y) > eps)
             {
@@ -53,84 +53,28 @@ public partial class FaceMouseSystem : SystemBase
             }
             else
             {
-                // Ray nahezu parallel → projiziere Origin auf Ebene
                 targetWorld = new float3(RayOrigin.x, fm.PlaneY, RayOrigin.z);
             }
 
-            // 2) Richtung vom Entity zur Zielposition
-            float3 toTarget = targetWorld - tf.Position;
+            // Berechne Rotation
+            float3 toTarget = targetWorld - pos;
+            if (fm.LockPitch == 1) toTarget.y = 0f;
 
-            if (fm.LockPitch == 1)
+            if (math.lengthsq(toTarget) > eps)
             {
-                toTarget.y = 0f;
-                if (math.lengthsq(toTarget) < 1e-8f) return;
-                float3 forward = math.normalize(toTarget);
-                quaternion desired = quaternion.LookRotationSafe(forward, new float3(0f, 1f, 0f));
-
-                if (fm.RotationSpeed <= 0f)
-                {
-                    tf.Rotation = desired;
-                }
-                else
-                {
-                    // Winkel zwischen Quaternions (in Grad)
-                    float dot = math.dot(tf.Rotation.value, desired.value);
-                    dot = math.clamp(dot, -1f, 1f);
-                    float angleRad = 2f * math.acos(math.abs(dot));
-                    float angleDeg = math.degrees(angleRad);
-
-                    if (angleDeg < 0.5f) // Threshold in Grad; passe an (0.1–1.0)
-                    {
-                        tf.Rotation = desired; // Optional: nur setzen bei Bedarf
-                        return;
-                    }
-
-                    if (angleDeg < 0.001f)
-                    {
-                        tf.Rotation = desired;
-                    }
-                    else
-                    {
-                        float tBlend = math.min(1f, (fm.RotationSpeed * DeltaTime) / angleDeg);
-                        tf.Rotation = math.slerp(tf.Rotation, desired, tBlend);
-                    }
-                }
-            }
-            else
-            {
-                if (math.lengthsq(toTarget) < 1e-8f) return;
                 quaternion desired = quaternion.LookRotationSafe(math.normalize(toTarget), new float3(0f, 1f, 0f));
 
-                if (fm.RotationSpeed <= 0f)
-                {
-                    tf.Rotation = desired;
-                }
-                else
-                {
-                    float dot = math.dot(tf.Rotation.value, desired.value);
-                    dot = math.clamp(dot, -1f, 1f);
-                    float angleRad = 2f * math.acos(math.abs(dot));
-                    float angleDeg = math.degrees(angleRad);
-
-                    if (angleDeg < 0.5f) // Threshold in Grad; passe an (0.1–1.0)
-                    {
-                        tf.Rotation = desired; // Optional: nur setzen bei Bedarf
-                        return;
-                    }
-
-                    if (angleDeg < 0.001f)
-                    {
-                        tf.Rotation = desired;
-                    }
-                    else
-                    {
-                        float tBlend = math.min(1f, (fm.RotationSpeed * DeltaTime) / angleDeg);
-                        tf.Rotation = math.slerp(tf.Rotation, desired, tBlend);
-                    }
-                }
+                // Slerp oder sofort
+                rot = fm.RotationSpeed <= 0f ? desired :
+                      math.slerp(rot, desired, math.min(1f, (fm.RotationSpeed * DeltaTime) / math.degrees(2f * math.acos(math.clamp(math.dot(rot.value, desired.value), -1f, 1f)))));
             }
+
+            // Update LocalToWorld direkt
+            ltw.Value = float4x4.TRS(pos, rot, new float3(1f));
         }
     }
+
+
 }
 
 /// <summary>

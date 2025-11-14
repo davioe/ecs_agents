@@ -14,19 +14,33 @@ public partial struct SpawnerSystem : ISystem
     [BurstCompile]
     public void OnUpdate(ref SystemState state)
     {
+        // System nur einmal ausführen
         state.Enabled = false;
-
-        var spawner = SystemAPI.GetSingleton<SpawnerComponent>();
 
         EntityCommandBuffer.ParallelWriter ecb = GetEntityCommandBuffer(ref state);
 
-        state.Dependency = new SpawnerJob
+        // --- Variante 1: Mit Prefab ---
+        if (SystemAPI.TryGetSingleton<SpawnerComponentWithPrefab>(out var spawnerWithPrefab))
         {
-            Prefab = spawner.Prefab,
-            FieldSize = spawner.FieldSize,
-            Seed = spawner.Seed,
-            Ecb = ecb
-        }.Schedule(spawner.Count, 64, state.Dependency);
+            state.Dependency = new SpawnerJobWithPrefab
+            {
+                Prefab = spawnerWithPrefab.Prefab,
+                FieldSize = spawnerWithPrefab.FieldSize,
+                Seed = spawnerWithPrefab.Seed,
+                Ecb = ecb
+            }.Schedule(spawnerWithPrefab.Count, 64, state.Dependency);
+        }
+
+        // --- Variante 2: Ohne Prefab ---
+        if (SystemAPI.TryGetSingleton<SpawnerComponentNoPrefab>(out var spawnerNoPrefab))
+        {
+            state.Dependency = new SpawnerJobNoPrefab
+            {
+                FieldSize = spawnerNoPrefab.FieldSize,
+                Seed = spawnerNoPrefab.Seed,
+                Ecb = ecb
+            }.Schedule(spawnerNoPrefab.Count, 64, state.Dependency);
+        }
     }
 
     private readonly EntityCommandBuffer.ParallelWriter GetEntityCommandBuffer(ref SystemState state)
