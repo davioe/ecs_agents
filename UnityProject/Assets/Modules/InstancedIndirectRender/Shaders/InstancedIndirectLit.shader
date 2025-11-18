@@ -21,16 +21,15 @@ Shader "Custom/InstancedIndirectLit"
             #pragma vertex LitPassVertex
             #pragma fragment LitPassFragment
 
+            // --- Instancing ---
             #pragma multi_compile_instancing
             #pragma multi_compile _ PROCEDURAL_INSTANCING_ON
             #pragma instancing_options procedural:InstancingSetup
 
-            #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN
+            // --- Lighting Keywords ---
             #pragma multi_compile _ _ADDITIONAL_LIGHTS_VERTEX _ADDITIONAL_LIGHTS
-            #pragma multi_compile_fragment _ _ADDITIONAL_LIGHT_SHADOWS
             #pragma multi_compile_fragment _ _REFLECTION_PROBE_BLENDING
             #pragma multi_compile_fragment _ _REFLECTION_PROBE_BOX_PROJECTION
-            #pragma multi_compile_fragment _ _SHADOWS_SOFT
             #pragma multi_compile_fragment _ _SCREEN_SPACE_OCCLUSION
             #pragma multi_compile_fragment _ _LIGHT_LAYERS
             #pragma multi_compile_fragment _ _LIGHT_COOKIES
@@ -39,7 +38,7 @@ Shader "Custom/InstancedIndirectLit"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
             #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/SpaceTransforms.hlsl"
-            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl"
+            #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/UnityInstancing.hlsl"
 
             StructuredBuffer<float4x4> _PerInstanceMatrices;
 
@@ -47,7 +46,7 @@ Shader "Custom/InstancedIndirectLit"
             {
                 #ifdef UNITY_PROCEDURAL_INSTANCING_ENABLED
                     unity_ObjectToWorld = _PerInstanceMatrices[unity_InstanceID];
-                    unity_WorldToObject = transpose(unity_ObjectToWorld);
+                    unity_WorldToObject = transpose(unity_ObjectToWorld); 
                 #endif
             }
 
@@ -65,7 +64,7 @@ Shader "Custom/InstancedIndirectLit"
                 float2 uv : TEXCOORD0;
                 float3 positionWS : TEXCOORD1;
                 float3 normalWS : TEXCOORD2;
-                float4 shadowCoord : TEXCOORD3;
+
                 UNITY_VERTEX_OUTPUT_STEREO
             };
 
@@ -88,10 +87,7 @@ Shader "Custom/InstancedIndirectLit"
                 output.positionWS = TransformObjectToWorld(input.positionOS.xyz);
                 output.positionCS = TransformWorldToHClip(output.positionWS);
                 output.normalWS = TransformObjectToWorldNormal(input.normalOS);
-
                 output.uv = TRANSFORM_TEX(input.uv, _BaseMap);
-
-                output.shadowCoord = TransformWorldToShadowCoord(output.positionWS);
 
                 return output;
             }
@@ -108,9 +104,8 @@ Shader "Custom/InstancedIndirectLit"
                 inputData.positionWS = input.positionWS;
                 inputData.normalWS = NormalizeNormalPerPixel(input.normalWS);
                 inputData.viewDirectionWS = GetWorldSpaceNormalizeViewDir(input.positionWS);
-                inputData.shadowCoord = input.shadowCoord;
-                inputData.normalizedScreenSpaceUV = GetNormalizedScreenSpaceUV(input.positionCS);
-                inputData.shadowMask = half4(1,1,1,1);  // No baked shadowmask/lightmaps assumed
+                
+                inputData.shadowMask = half4(1,1,1,1); 
 
                 SurfaceData surfaceData = (SurfaceData)0;
                 surfaceData.albedo = albedo;
@@ -126,74 +121,6 @@ Shader "Custom/InstancedIndirectLit"
                 half4 color = UniversalFragmentPBR(inputData, surfaceData);
 
                 return color;
-            }
-            ENDHLSL
-        }
-
-        Pass
-        {
-            Name "ShadowCaster"
-            Tags {"LightMode" = "ShadowCaster"}
-
-            ZWrite On
-            ZTest LEqual
-            ColorMask 0
-
-            HLSLPROGRAM
-            #pragma vertex ShadowPassVertex
-            #pragma fragment ShadowPassFragment
-
-            #pragma multi_compile_instancing
-            #pragma multi_compile _ PROCEDURAL_INSTANCING_ON
-            #pragma instancing_options procedural:InstancingSetup
-
-            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
-            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
-            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl"
-
-            StructuredBuffer<float4x4> _PerInstanceMatrices;
-
-            void InstancingSetup()
-            {
-                #ifdef UNITY_PROCEDURAL_INSTANCING_ENABLED
-                unity_ObjectToWorld = _PerInstanceMatrices[unity_InstanceID];
-                unity_WorldToObject = transpose(unity_ObjectToWorld); // Simple inverse
-                #endif
-            }
-
-            struct Attributes
-            {
-                float4 positionOS : POSITION;
-                float3 normalOS : NORMAL;
-                UNITY_VERTEX_INPUT_INSTANCE_ID
-            };
-
-            struct Varyings
-            {
-                float4 positionCS : SV_POSITION;
-            };
-
-            float3 _LightDirection;
-            float3 _LightPosition;
-
-            Varyings ShadowPassVertex(Attributes input)
-            {
-                Varyings output;
-
-                UNITY_SETUP_INSTANCE_ID(input);
-
-                float3 positionWS = TransformObjectToWorld(input.positionOS.xyz);
-                float3 normalWS = TransformObjectToWorldNormal(input.normalOS);
-
-                float4 positionCS = TransformWorldToHClip(ApplyShadowBias(positionWS, normalWS, _LightDirection));
-
-                output.positionCS = positionCS;
-                return output;
-            }
-
-            half4 ShadowPassFragment(Varyings input) : SV_Target
-            {
-                return 0;
             }
             ENDHLSL
         }
