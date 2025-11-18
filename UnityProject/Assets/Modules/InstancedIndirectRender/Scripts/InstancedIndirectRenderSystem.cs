@@ -12,25 +12,26 @@ using UnityEngine.Rendering;
 [BurstCompile]
 public partial class InstancedIndirectRenderSystem : SystemBase
 {
+    // ⭐ Persistente ECS-Daten
     ComputeBuffer _instanceBuffer;
     ComputeBuffer _argsBuffer;
-    readonly uint[] _args = new uint[5] { 0, 0, 0, 0, 0 };
+    NativeArray<float4x4> _matrixArray;
 
+    // Allgemeine Rendering-Daten
     Mesh _mesh;
     Material _material;
     EntityQuery _query;
+
+    // Konstante oder statische Daten
+    readonly uint[] _args = new uint[5] { 0, 0, 0, 0, 0 };
+    // Bounds persistent deklariert, um Heap-Allokationen pro Frame zu vermeiden
+    readonly Bounds _worldBounds = new(Vector3.zero, new Vector3(1000f, 1000f, 1000f));
     uint _indexCountPerInstance = 0;
 
-    // --- ⭐ Pipelining-Variablen ---
-
-    // Wir brauchen einen permanenten Speicher für die Job-Ergebnisse
-    NativeArray<float4x4> _matrixArray;
-
-    // Das JobHandle, das die Daten für den *nächsten* Draw-Call vorbereitet
+    // ⭐ Pipelining-Variablen (Status von Frame N-1)
     JobHandle _dataPrepHandle;
-
     int _currentCapacity = 0;
-    int _previousFrameCount = 0; // Die Anzahl der Instanzen aus dem letzten Frame
+    int _previousFrameCount = 0;
     bool _buffersAreInitialized = false;
 
     // ---------------------------------
@@ -48,15 +49,14 @@ public partial class InstancedIndirectRenderSystem : SystemBase
         _mesh = renderConfig.Mesh;
         _material = renderConfig.Material;
 
-        if (_mesh == null) return;
+        if (_mesh == null || _material == null) return;
 
         _indexCountPerInstance = (uint)_mesh.GetIndexCount(0);
         _args[0] = _indexCountPerInstance;
 
-        // Initiale Kapazität
         _currentCapacity = 1024;
 
-        // ⭐ Initialisiere die persistenten Buffer
+        // Initialisiere die persistenten Buffer und das NativeArray
         _instanceBuffer = new ComputeBuffer(_currentCapacity, sizeof(float) * 16, ComputeBufferType.Structured);
         _argsBuffer = new ComputeBuffer(5, sizeof(uint), ComputeBufferType.IndirectArguments);
         _matrixArray = new NativeArray<float4x4>(_currentCapacity, Allocator.Persistent);
@@ -68,7 +68,6 @@ public partial class InstancedIndirectRenderSystem : SystemBase
     {
         base.OnDestroy();
 
-        // ⭐ WICHTIG: Auf den letzten Job warten, bevor wir die Daten löschen
         _dataPrepHandle.Complete();
 
         _instanceBuffer?.Dispose();
@@ -78,7 +77,7 @@ public partial class InstancedIndirectRenderSystem : SystemBase
         _buffersAreInitialized = false;
     }
 
-    // Job bleibt gleich
+    // ⭐ Job-Struktur (entspricht IJobEntity) wieder eingeführt, um Entities.ForEach zu vermeiden
     [BurstCompile]
     partial struct GatherMatricesJob : IJobEntity
     {
@@ -91,18 +90,16 @@ public partial class InstancedIndirectRenderSystem : SystemBase
 
     /// <summary>
     /// Stellt sicher, dass alle Buffer die benötigte Kapazität haben.
-    /// Muss auf den Job warten, wenn eine Neuerstellung nötig ist.
     /// </summary>
     void EnsureCapacity(int count)
     {
         if (count <= _currentCapacity)
-            return; // Alles gut
+            return;
 
-        // ⭐ Wir müssen die Größe ändern. Wir MÜSSEN auf den Job warten,
-        // da er vielleicht gerade in das Array schreibt, das wir löschen.
+        // Muss auf den Job warten, da er sonst in das Array schreiben könnte, das wir löschen.
         _dataPrepHandle.Complete();
 
-        // Alte Buffer/Arrays freigeben
+        // Freigabe
         _instanceBuffer?.Dispose();
         if (_matrixArray.IsCreated) _matrixArray.Dispose();
 
@@ -121,49 +118,40 @@ public partial class InstancedIndirectRenderSystem : SystemBase
             return;
 
         // --- 1. Auf den Job von Frame N-1 warten ---
-        // Dieser Job hat die Daten vorbereitet, die wir *jetzt* zeichnen.
-        // Im ersten Frame ist dieser Handle leer.
         _dataPrepHandle.Complete();
 
         // --- 2. Daten von Frame N-1 hochladen & zeichnen ---
-        // (Nur wenn wir tatsächlich Daten aus dem Vor-Frame haben)
         if (_previousFrameCount > 0)
         {
-            // ⭐ Upload zur GPU (schnell, da Daten bereit sind)
             _instanceBuffer.SetData(_matrixArray, 0, 0, _previousFrameCount);
 
-            // Argumente setzen (Anzahl von N-1)
             _args[1] = (uint)_previousFrameCount;
             _argsBuffer.SetData(_args);
 
             _material.SetBuffer("_PerInstanceMatrices", _instanceBuffer);
 
-            // Bounds (immer noch das Culling-Problem)
-            var worldBounds = new Bounds(Vector3.zero, _mesh.bounds.size * 1000f);
-
-            // ⭐ Draw Call für Frame N (mit Daten von N-1)
+            // Draw Call für Frame N (mit Daten von N-1)
             Graphics.DrawMeshInstancedIndirect(
-                _mesh, 0, _material, worldBounds, _argsBuffer,
+                _mesh, 0, _material, _worldBounds, _argsBuffer,
                 0, null, ShadowCastingMode.On, true, 0, null, LightProbeUsage.Off
             );
         }
 
-        // --- 3. Daten für Frame N+1 vorbereiten ---
+        // --- 3. Daten für Frame N+1 vorbereiten (Job starten) ---
 
         int currentFrameCount = _query.CalculateEntityCount();
         if (currentFrameCount == 0)
         {
-            _previousFrameCount = 0; // Nichts zu tun für den nächsten Frame
+            _previousFrameCount = 0;
             return;
         }
 
-        // Buffer-Größe für *diesen* Frame anpassen (falls nötig)
         EnsureCapacity(currentFrameCount);
 
-        // Job schedulen, der in unser persistentes Array schreibt
+        // Job schedulen
         var gatherJob = new GatherMatricesJob
         {
-            // Wichtig: Nur den Teil des Arrays übergeben, den wir brauchen
+            // Wichtig: Nur den Teil des Arrays übergeben
             InstanceData = _matrixArray.GetSubArray(0, currentFrameCount)
         };
 
