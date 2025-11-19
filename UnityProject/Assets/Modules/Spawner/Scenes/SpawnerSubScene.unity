@@ -178,7 +178,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: bd8a2bc8e1be1c14b837f1274a8e9b88, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  Count: 100000
+  Count: 10000
   FieldSize:
     x: 50
     y: 50

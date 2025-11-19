@@ -3,165 +3,223 @@ using Unity.Collections;
 using Unity.Entities;
 using Unity.Jobs;
 using Unity.Mathematics;
-using Unity.Rendering;
 using Unity.Transforms;
 using UnityEngine;
 using UnityEngine.Rendering;
 
 [UpdateInGroup(typeof(PresentationSystemGroup))]
-[BurstCompile]
-public partial class InstancedIndirectRenderSystem : SystemBase
+public partial class InstancedIndirectRenderManagedSystem : SystemBase
 {
-    // ⭐ Persistente ECS-Daten
-    ComputeBuffer _instanceBuffer;
-    ComputeBuffer _argsBuffer;
-    NativeArray<float4x4> _matrixArray;
+    // Persistente managed Ressourcen (dürfen in SystemBase liegen)
+    public ComputeBuffer InstanceBuffer { get; private set; }
+    public ComputeBuffer ArgsBuffer { get; private set; }
+    public NativeArray<float4x4> MatrixArray; // NativeArray ist in managed holder ok (Allocator.Persistent)
+    public JobHandle DataPrepHandle = default;
+    private MaterialPropertyBlock _mpb;
+    private bool _mpbBoundToBuffer = false; // true, wenn _mpb bereits das aktuelle InstanceBuffer enthält
 
-    // Allgemeine Rendering-Daten
-    Mesh _mesh;
-    Material _material;
-    EntityQuery _query;
-
-    // Konstante oder statische Daten
+    public bool BuffersInitialized { get; private set; } = false;
+    public int CurrentCapacity { get; private set; } = 0;
+    public int PreviousFrameCount = 0;
+    public uint IndexCountPerInstance = 0;
     readonly uint[] _args = new uint[5] { 0, 0, 0, 0, 0 };
-    // Bounds persistent deklariert, um Heap-Allokationen pro Frame zu vermeiden
-    readonly Bounds _worldBounds = new(Vector3.zero, new Vector3(1000f, 1000f, 1000f));
-    uint _indexCountPerInstance = 0;
-
-    // ⭐ Pipelining-Variablen (Status von Frame N-1)
-    JobHandle _dataPrepHandle;
-    int _currentCapacity = 0;
-    int _previousFrameCount = 0;
-    bool _buffersAreInitialized = false;
-
-    // ---------------------------------
+    // Bounds bleiben unverändert wie gewünscht
+    readonly Bounds _worldBounds = new Bounds(Vector3.zero, new Vector3(1000f, 1000f, 1000f));
 
     protected override void OnCreate()
     {
         base.OnCreate();
-        RequireForUpdate<InstancedIndirectRenderingComponent>();
-        _query = GetEntityQuery(ComponentType.ReadOnly<LocalToWorld>(), ComponentType.ReadOnly<FaceMouseComponent>());
     }
 
-    protected override void OnStartRunning()
+    /// <summary>
+    /// Initialisiert Buffer / NativeArray (wenn Mesh/Material bekannt sind)
+    /// </summary>
+    public void EnsureInitialized(Mesh mesh, Material material, int initialCapacity = 1024)
     {
-        var renderConfig = SystemAPI.GetSingleton<InstancedIndirectRenderingComponent>();
-        _mesh = renderConfig.Mesh;
-        _material = renderConfig.Material;
+        if (BuffersInitialized) return;
+        if (mesh == null || material == null) return;
 
-        if (_mesh == null || _material == null) return;
+        IndexCountPerInstance = (uint)mesh.GetIndexCount(0);
+        _args[0] = IndexCountPerInstance;
 
-        _indexCountPerInstance = (uint)_mesh.GetIndexCount(0);
-        _args[0] = _indexCountPerInstance;
+        CurrentCapacity = math.max(32, initialCapacity);
 
-        _currentCapacity = 1024;
+        // ComputeBuffer / ArgsBuffer / NativeArray anlegen
+        InstanceBuffer = new ComputeBuffer(CurrentCapacity, sizeof(float) * 16, ComputeBufferType.Structured);
+        ArgsBuffer = new ComputeBuffer(5, sizeof(uint), ComputeBufferType.IndirectArguments);
+        MatrixArray = new NativeArray<float4x4>(CurrentCapacity, Allocator.Persistent);
 
-        // Initialisiere die persistenten Buffer und das NativeArray
-        _instanceBuffer = new ComputeBuffer(_currentCapacity, sizeof(float) * 16, ComputeBufferType.Structured);
-        _argsBuffer = new ComputeBuffer(5, sizeof(uint), ComputeBufferType.IndirectArguments);
-        _matrixArray = new NativeArray<float4x4>(_currentCapacity, Allocator.Persistent);
+        // MaterialPropertyBlock einmalig anlegen und binden
+        _mpb = new MaterialPropertyBlock();
+        _mpb.SetBuffer("_PerInstanceMatrices", InstanceBuffer);
+        _mpbBoundToBuffer = true;
 
-        _buffersAreInitialized = true;
+        BuffersInitialized = true;
+    }
+
+    public void EnsureCapacity(int count)
+    {
+        if (count <= CurrentCapacity) return;
+
+        // Warte auf evtl. laufenden Job, bevor du resize machst
+        DataPrepHandle.Complete();
+
+        // Dispose vorheriger Ressourcen
+        InstanceBuffer?.Dispose();
+        if (MatrixArray.IsCreated) MatrixArray.Dispose();
+
+        int newCap = math.max(count, CurrentCapacity * 2);
+        CurrentCapacity = newCap;
+
+        InstanceBuffer = new ComputeBuffer(CurrentCapacity, sizeof(float) * 16, ComputeBufferType.Structured);
+        MatrixArray = new NativeArray<float4x4>(CurrentCapacity, Allocator.Persistent);
+
+        // MPB neu binden, da Buffer ersetzt wurde
+        if (_mpb == null) _mpb = new MaterialPropertyBlock();
+        _mpb.SetBuffer("_PerInstanceMatrices", InstanceBuffer);
+        _mpbBoundToBuffer = true;
+    }
+
+    public void UploadAndDrawIfNeeded(Mesh mesh, Material material)
+    {
+        // Diese Methode wird vom ISystem (Main thread) aufgerufen
+        if (!BuffersInitialized || mesh == null || material == null)
+            return;
+
+        // Warten auf Job (Frame N-1) — sicherstellen, dass MatrixArray fertig ist
+        DataPrepHandle.Complete();
+
+        if (PreviousFrameCount > 0)
+        {
+            // Upload der tatsächlich benötigten Matrizen
+            InstanceBuffer.SetData(MatrixArray, 0, 0, PreviousFrameCount);
+            _args[1] = (uint)PreviousFrameCount;
+            ArgsBuffer.SetData(_args);
+
+            // MPB ist nur gesetzt, wenn Buffer neu erstellt wurde. Keine redundanten SetBuffer-Aufrufe mehr pro Frame.
+            if (!_mpbBoundToBuffer)
+            {
+                if (_mpb == null) _mpb = new MaterialPropertyBlock();
+                _mpb.SetBuffer("_PerInstanceMatrices", InstanceBuffer);
+                _mpbBoundToBuffer = true;
+            }
+
+            Graphics.DrawMeshInstancedIndirect(
+                mesh, 0, material, _worldBounds, ArgsBuffer,
+                0, _mpb, ShadowCastingMode.On, true, 0, null, LightProbeUsage.Off
+            );
+        }
+    }
+
+    protected override void OnUpdate()
+    {
+        // kein Runtime-Work hier – ISystem übernimmt Scheduling
     }
 
     protected override void OnDestroy()
     {
+        // Clean up managed/unmanaged resources
+        DataPrepHandle.Complete();
+
+        InstanceBuffer?.Dispose();
+        ArgsBuffer?.Dispose();
+        if (MatrixArray.IsCreated) MatrixArray.Dispose();
+
+        BuffersInitialized = false;
         base.OnDestroy();
-
-        _dataPrepHandle.Complete();
-
-        _instanceBuffer?.Dispose();
-        _argsBuffer?.Dispose();
-        if (_matrixArray.IsCreated) _matrixArray.Dispose();
-
-        _buffersAreInitialized = false;
     }
+}
 
-    // ⭐ Job-Struktur (entspricht IJobEntity) wieder eingeführt, um Entities.ForEach zu vermeiden
+[UpdateInGroup(typeof(PresentationSystemGroup))]
+public partial struct InstancedIndirectRenderSystem : ISystem, ISystemStartStop
+{
+    private EntityQuery _renderQuery;
+
+    // Wir speichern keine managed Felder hier (ISystem muss unmanaged bleiben).
+    // Die managed Ressourcen (ComputeBuffer, Mesh, Material, NativeArray mit Allocator.Persistent)
+    // leben im InstancedIndirectRenderManagedSystem (SystemBase), das wir vom ISystem aus aufrufen.
+
+    // --- Job: Sammle Matrizen (burst-kompiliert) ---
     [BurstCompile]
     partial struct GatherMatricesJob : IJobEntity
     {
+        // Wir schreiben direkt in das persistente MatrixArray. Die Job-Ausführung schreibt
+        // nur bis entityInQueryIndex < actualEntityCount, also ist es sicher, das gesamte Array
+        // zu übergeben (kein GetSubArray/Allokation pro Frame nötig).
         [WriteOnly] public NativeArray<float4x4> InstanceData;
+
         public void Execute([ReadOnly] in LocalToWorld ltw, [EntityIndexInQuery] int entityInQueryIndex)
         {
             InstanceData[entityInQueryIndex] = ltw.Value;
         }
     }
 
-    /// <summary>
-    /// Stellt sicher, dass alle Buffer die benötigte Kapazität haben.
-    /// </summary>
-    void EnsureCapacity(int count)
+    // OnCreate: non-burst context, sicher für managed world calls
+    public void OnCreate(ref SystemState state)
     {
-        if (count <= _currentCapacity)
-            return;
+        state.RequireForUpdate<InstancedIndirectRenderingComponent>();
 
-        // Muss auf den Job warten, da er sonst in das Array schreiben könnte, das wir löschen.
-        _dataPrepHandle.Complete();
+        // Query einmalig erzeugen, NICHT im Update
+        _renderQuery = state.GetEntityQuery(
+            ComponentType.ReadOnly<LocalToWorld>()
+        );
 
-        // Freigabe
-        _instanceBuffer?.Dispose();
-        if (_matrixArray.IsCreated) _matrixArray.Dispose();
-
-        // Neue Kapazität berechnen
-        int newCap = math.max(count, _currentCapacity * 2);
-        _currentCapacity = newCap;
-
-        // Neu erstellen
-        _instanceBuffer = new ComputeBuffer(_currentCapacity, sizeof(float) * 16, ComputeBufferType.Structured);
-        _matrixArray = new NativeArray<float4x4>(_currentCapacity, Allocator.Persistent);
+        // managed owner system sicherstellen (wird bei Bedarf erzeugt)
+        state.World.GetOrCreateSystemManaged<InstancedIndirectRenderManagedSystem>();
     }
 
-    protected override void OnUpdate()
+    public void OnStartRunning(ref SystemState state) { }
+
+    public void OnStopRunning(ref SystemState state) { }
+
+    // WICHTIG: OnUpdate ist hier absichtlich **nicht** mit [BurstCompile] markiert,
+    // damit wir managed APIs verwenden dürfen (z. B. das Managed-System oder Graphics.DrawMeshInstancedIndirect).
+    // Die Jobs innerhalb bleiben geburstet.
+    public void OnUpdate(ref SystemState state)
     {
-        if (!_buffersAreInitialized || _mesh == null || _material == null)
-            return;
+        var managed = state.World.GetExistingSystemManaged<InstancedIndirectRenderManagedSystem>();
+        if (managed == null) return;
 
-        // --- 1. Auf den Job von Frame N-1 warten ---
-        _dataPrepHandle.Complete();
+        var cfg = SystemAPI.GetSingleton<InstancedIndirectRenderingComponent>();
+        Mesh mesh = cfg.Mesh;
+        Material mat = cfg.Material;
 
-        // --- 2. Daten von Frame N-1 hochladen & zeichnen ---
-        if (_previousFrameCount > 0)
+        if (mesh == null || mat == null) return;
+
+        if (!managed.BuffersInitialized)
         {
-            _instanceBuffer.SetData(_matrixArray, 0, 0, _previousFrameCount);
-
-            _args[1] = (uint)_previousFrameCount;
-            _argsBuffer.SetData(_args);
-
-            _material.SetBuffer("_PerInstanceMatrices", _instanceBuffer);
-
-            // Draw Call für Frame N (mit Daten von N-1)
-            Graphics.DrawMeshInstancedIndirect(
-                _mesh, 0, _material, _worldBounds, _argsBuffer,
-                0, null, ShadowCastingMode.On, true, 0, null, LightProbeUsage.Off
-            );
+            managed.EnsureInitialized(mesh, mat, 1024);
+            if (!managed.BuffersInitialized) return;
         }
 
-        // --- 3. Daten für Frame N+1 vorbereiten (Job starten) ---
+        // Upload+Draw von Frame N-1
+        managed.UploadAndDrawIfNeeded(mesh, mat);
 
-        int currentFrameCount = _query.CalculateEntityCount();
+        // Hier nutzen wir die Query, die im OnCreate erzeugt wurde
+        int currentFrameCount = _renderQuery.CalculateEntityCount();
         if (currentFrameCount == 0)
         {
-            _previousFrameCount = 0;
+            managed.PreviousFrameCount = 0;
             return;
         }
 
-        EnsureCapacity(currentFrameCount);
+        managed.EnsureCapacity(currentFrameCount);
 
-        // Job schedulen
-        var gatherJob = new GatherMatricesJob
+        // Kein GetSubArray mehr — Job schreibt direkt in das persistente MatrixArray.
+        var job = new GatherMatricesJob
         {
-            // Wichtig: Nur den Teil des Arrays übergeben
-            InstanceData = _matrixArray.GetSubArray(0, currentFrameCount)
+            InstanceData = managed.MatrixArray
         };
 
-        // ⭐ Job für Frame N starten (wird in N+1 fertig sein)
-        _dataPrepHandle = gatherJob.ScheduleParallel(_query, Dependency);
+        JobHandle handle = job.ScheduleParallel(_renderQuery, state.Dependency);
+        managed.DataPrepHandle = handle;
+        state.Dependency = handle;
 
-        // System-Dependency aktualisieren
-        Dependency = _dataPrepHandle;
+        managed.PreviousFrameCount = currentFrameCount;
+    }
 
-        // Anzahl für den nächsten Frame speichern
-        _previousFrameCount = currentFrameCount;
+    public void OnDestroy(ref SystemState state)
+    {
+        // Nothing to do here. Managed SystemBase kümmert sich um Dispose in seinem OnDestroy.
     }
 }
